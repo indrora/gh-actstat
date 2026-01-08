@@ -4,13 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sort"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 
-	"github.com/theckman/yacspin"
+	"strings"
 
 	"github.com/cli/go-gh/v2/pkg/auth"
 	"github.com/cli/go-gh/v2/pkg/repository"
@@ -74,114 +69,6 @@ func getTargetRepo() *repository.Repository {
 	return targetRepo
 }
 
-func fetchWorkflows(ghClient *github.Client, cRepo *repository.Repository) *github.Workflows {
-	workflows, _, err := ghClient.Actions.ListWorkflows(context.Background(), cRepo.Owner, cRepo.Name, &github.ListOptions{})
-	if err != nil {
-		fmt.Printf("error fetching workflows: %v\n", err)
-		os.Exit(1)
-	}
-	return workflows
-}
-
-func fetchRunsForWorkflows(ghClient *github.Client, cRepo *repository.Repository, workflows *github.Workflows) []*WorkflowSummary {
-	var wg sync.WaitGroup
-	summaries := make([]*WorkflowSummary, 0, len(workflows.Workflows))
-	mu := sync.Mutex{}
-
-	var runsTotal int64 = int64(len(workflows.Workflows))
-	var runsDone int64
-	var jobsTotal int64
-	var jobsDone int64
-
-	done := make(chan struct{})
-	cfg := yacspin.Config{
-		Frequency: 150 * time.Millisecond,
-		Writer:    os.Stdout,
-		CharSet:   yacspin.CharSets[14],
-	}
-	s, serr := yacspin.New(cfg)
-	if serr == nil {
-		s.Start()
-		go func() {
-			t := time.NewTicker(150 * time.Millisecond)
-			defer t.Stop()
-			for {
-				select {
-				case <-done:
-					s.Stop()
-					return
-				case <-t.C:
-					rDone := atomic.LoadInt64(&runsDone)
-					rTot := atomic.LoadInt64(&runsTotal)
-					jDone := atomic.LoadInt64(&jobsDone)
-					jTot := atomic.LoadInt64(&jobsTotal)
-					s.Message(fmt.Sprintf(" Fetching runs %d/%d jobs %d/%d", rDone, rTot, jDone, jTot))
-				}
-			}
-		}()
-	} else {
-		panic(serr)
-	}
-
-	for _, wf := range workflows.Workflows {
-		wf := wf
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			runsResp, _, err := ghClient.Actions.ListWorkflowRunsByID(context.Background(), cRepo.Owner, cRepo.Name, wf.GetID(), &github.ListWorkflowRunsOptions{ListOptions: github.ListOptions{PerPage: 50}})
-			if err != nil {
-				fmt.Printf("\n  error fetching runs for workflow %s: %v\n", wf.GetName(), err)
-				atomic.AddInt64(&runsDone, 1)
-				return
-			}
-			if len(runsResp.WorkflowRuns) == 0 {
-				atomic.AddInt64(&runsDone, 1)
-				return
-			}
-
-			ws := &WorkflowSummary{Workflow: wf, Runs: runsResp.WorkflowRuns, RunSums: map[int64]*RunSummary{}}
-
-			var innerWg sync.WaitGroup
-			for _, run := range ws.Runs {
-				if run == nil {
-					continue
-				}
-				runID := run.GetID()
-				rs := &RunSummary{Run: run}
-				ws.RunSums[runID] = rs
-				if run.Status != nil && *run.Status == "in_progress" {
-					atomic.AddInt64(&jobsTotal, 1)
-					innerWg.Add(1)
-					go func(r *github.WorkflowRun, rs *RunSummary) {
-						defer innerWg.Done()
-						defer atomic.AddInt64(&jobsDone, 1)
-						jobsResp, _, jerr := ghClient.Actions.ListWorkflowJobs(context.Background(), cRepo.Owner, cRepo.Name, r.GetID(), nil)
-						if jerr != nil {
-							rs.JobsErr = jerr
-							return
-						}
-						rs.Jobs = jobsResp.Jobs
-					}(run, rs)
-				}
-			}
-			innerWg.Wait()
-
-			mu.Lock()
-			summaries = append(summaries, ws)
-			mu.Unlock()
-
-			atomic.AddInt64(&runsDone, 1)
-		}()
-	}
-	wg.Wait()
-	close(done)
-
-	sort.SliceStable(summaries, func(i, j int) bool {
-		return strings.ToLower(summaries[i].Workflow.GetName()) < strings.ToLower(summaries[j].Workflow.GetName())
-	})
-	return summaries
-}
-
 func printSummaries(ghClient *github.Client, cRepo *repository.Repository, summaries []*WorkflowSummary) {
 	for _, ws := range summaries {
 		wf := ws.Workflow
@@ -207,6 +94,7 @@ func printSummaries(ghClient *github.Client, cRepo *repository.Repository, summa
 				glyphs = append(glyphs, "*️⃣")
 			}
 		}
+
 		fmt.Println("  Chart:", strings.Join(glyphs, ""))
 
 		most := ws.Runs[0]
